@@ -248,8 +248,34 @@ class ContinuousTokenBuilder:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
-        """Tokenize the tokens added only by ``add_generation_prompt=True``."""
-        return self.render_delta_token_id(updated_messages, [], add_generation_prompt=True, tools=tools)
+        """Tokenize the tokens added only by ``add_generation_prompt=True``.
+
+        Renders a bounded pseudo conversation that ends with the same message as
+        the real one instead of the accumulated history. Rendering the full
+        conversation twice per tool turn made tokenization cost quadratic in the
+        number of turns and dominated long agent rollouts (#7617). This mirrors
+        how ``_tokenize_tool_group`` and ``_tokenize_single_non_tool`` already
+        bound their renders, and the Gemma4 builder's existing override.
+        """
+        if not updated_messages:
+            return self.render_delta_token_id(
+                [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE],
+                [],
+                add_generation_prompt=True,
+                tools=tools,
+            )
+        last_message = updated_messages[-1]
+        if last_message.get("role") == "tool":
+            # Tool messages need a preceding assistant tool call to render.
+            pseudo_prefix = [
+                _SYNTHETIC_SYSTEM_MESSAGE,
+                _SYNTHETIC_USER_MESSAGE,
+                self._synthetic_assistant_for_tools([last_message]),
+                last_message,
+            ]
+        else:
+            pseudo_prefix = [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE, last_message]
+        return self.render_delta_token_id(pseudo_prefix, [], add_generation_prompt=True, tools=tools)
 
     def _iter_append_groups(self, appended_messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         groups: list[list[dict[str, Any]]] = []

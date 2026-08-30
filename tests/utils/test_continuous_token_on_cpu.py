@@ -1780,3 +1780,87 @@ def test_vl_builder_preserves_explicit_sampling_rate_over_processor_default():
     )
 
     assert builder.mm_processor_kwargs["sampling_rate"] == 24000
+
+
+def test_generation_prompt_delta_render_is_bounded_for_long_histories():
+    tokenizer = _RecordingTemplateTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "question"},
+    ]
+    for turn in range(40):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call-{turn}",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            }
+        )
+        previous = list(messages)
+        messages.append({"role": "tool", "content": f"result {turn}", "tool_call_id": f"call-{turn}"})
+        builder.tokenize_non_assistant_incremental_messages(previous, messages)
+
+    max_rendered = max(len(call["messages"]) for call in tokenizer.calls)
+    assert max_rendered <= 5, (
+        f"incremental tokenization rendered {max_rendered} messages in one call; "
+        "renders must stay bounded regardless of history length"
+    )
+
+
+@pytest.mark.parametrize(
+    "last_message",
+    [
+        {"role": "user", "content": "follow-up"},
+        {"role": "system", "content": "control message"},
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "name": "lookup",
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    ("model_family", "tokenizer_cls"),
+    [
+        ("default", _TemplateTokenizer),
+        ("qwen3", _QwenBoundaryTokenizer),
+        ("minimaxm2", _MiniMaxBoundaryTokenizer),
+        ("glm47", _GLMBoundaryTokenizer),
+    ],
+)
+def test_generation_prompt_delta_matches_full_history_render(model_family, tokenizer_cls, last_message):
+    tokenizer = tokenizer_cls()
+    builder = create_continuous_token_builder(tokenizer, model_family=model_family)
+    conversation = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {}},
+                }
+            ],
+        },
+        last_message,
+    ]
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    bounded = builder._tokenize_generation_prompt_delta(conversation, tools=tools)
+    full_history = builder.render_delta_token_id(conversation, [], add_generation_prompt=True, tools=tools)
+
+    assert bounded == full_history
