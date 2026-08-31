@@ -118,5 +118,16 @@ return_multi_modal_inputs: True
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
 
+# Continuous Token boundary handling.
+continuous_token:
+
+  # Builder family override. auto (the default) infers the family by exact lookup of the root
+  # Hugging Face config's model_type. Set a family explicitly when the checkpoint pairs an
+  # architecture with another vendor's tokenizer and chat template, and therefore fails to
+  # construct the inferred builder (the DeepSeek-R1 distills of Qwen need `deepseek`).
+  # Options: the families listed in CONTINUOUS_TOKEN_BUILDER_FAMILIES
+  # (verl/utils/tokenizer/continuous_token_wiring.py), plus auto.
+  model_family: auto
+
 # Additional kwargs passed to multimodal processors/backends.
 mm_processor_kwargs: {}

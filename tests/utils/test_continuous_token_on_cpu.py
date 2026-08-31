@@ -276,6 +276,26 @@ class _DeepSeekBoundaryTokenizer(_TemplateTokenizer):
         return rendered
 
 
+class _DistillTokenizer(_DeepSeekBoundaryTokenizer):
+    """DeepSeek-R1 distill of Qwen: the root config keeps a Qwen ``model_type`` but the
+    checkpoint ships DeepSeek's tokenizer and chat template, in which ``<|im_end|>``
+    does not exist (renamed to ``<｜end▁of▁sentence｜>``)."""
+
+    name_or_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    unk_token_id = None
+
+    def __init__(self):
+        super().__init__()
+        self.assistant_id = 2
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<｜end▁of▁sentence｜>":
+            return self.eos_id
+        if token == "<｜Assistant｜>":
+            return self.assistant_id
+        return None
+
+
 class _MissingSpecialTokenTokenizer(_TemplateTokenizer):
     def convert_tokens_to_ids(self, token):
         return None
@@ -468,6 +488,48 @@ def test_unknown_model_with_non_multimodal_processor_uses_default_text_builder(c
     assert isinstance(builder, ContinuousTokenBuilder)
     assert "unknown_text_model" in caplog.text
     assert "default" in caplog.text
+
+
+def test_auto_family_construction_error_points_at_the_model_family_override():
+    with pytest.raises(ValueError) as excinfo:
+        create_continuous_token_builder(_DistillTokenizer(), hf_model_type="qwen2")
+
+    message = str(excinfo.value)
+    assert "required token '<|im_end|>'" in message
+    assert "data.continuous_token.model_family" in message
+    assert "deepseek" in message
+
+
+def test_explicit_model_family_override_selects_the_matching_builder():
+    tokenizer = _DistillTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="deepseek", hf_model_type="qwen2")
+
+    assert type(builder) is DeepSeekContinuousTokenBuilder
+
+    # The selected builder renders the distill's DeepSeek-style template: tool appends
+    # splice the synthetic call's arguments in by string concatenation.
+    previous_messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_0", "type": "function", "function": {"name": "lookup", "arguments": {"q": "x"}}}
+            ],
+        },
+    ]
+    updated_messages = previous_messages + [{"role": "tool", "content": "answer", "tool_call_id": "call_0"}]
+    incremental = builder.tokenize_non_assistant_incremental_messages(previous_messages, updated_messages)
+    assert incremental == [ord(char) for char in "<tool_output_begin>answer<tool_output_end>"]
+
+
+def test_explicit_family_that_cannot_construct_raises_the_original_error():
+    with pytest.raises(ValueError) as excinfo:
+        create_continuous_token_builder(_DistillTokenizer(), model_family="qwen")
+
+    message = str(excinfo.value)
+    assert "required token '<|im_end|>'" in message
+    assert "model_family" not in message
 
 
 def test_default_builder_creation_forwards_kwargs():

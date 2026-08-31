@@ -32,6 +32,7 @@ from .continuous_token import (
     KimiVLContinuousTokenBuilder,
     MiniMaxContinuousTokenBuilder,
     MiniMaxVLContinuousTokenBuilder,
+    MissingRequiredTokenError,
     QwenContinuousTokenBuilder,
     QwenVLContinuousTokenBuilder,
     VLContinuousTokenBuilder,
@@ -307,7 +308,25 @@ def create_continuous_token_builder(
             f"Ensure the processor is loaded for vision-language models."
         )
     logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-    return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    try:
+        return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    except MissingRequiredTokenError as exc:
+        if _normalize_model_family(model_family) != ContinuousTokenModelFamily.AUTO:
+            raise
+        # The builder inferred from the architecture cannot work with this tokenizer: the
+        # checkpoint pairs a registered model_type with another vendor's tokenizer and chat
+        # template (the DeepSeek-R1 distills keep Qwen model_type values but rename
+        # ``<|im_end|>`` away). Point the user at the explicit override, since the builder
+        # has to follow the chat template's conversation protocol, not the architecture.
+        raise MissingRequiredTokenError(
+            f"{builder_cls.__name__}, inferred from config.json model_type="
+            f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. The "
+            f"checkpoint pairs this architecture with another vendor's tokenizer and chat "
+            f"template (the DeepSeek-R1 distills of Qwen ship DeepSeek's, which rename "
+            f"<|im_end|> away). Set data.continuous_token.model_family to the family matching "
+            f"the chat template (deepseek for these checkpoints) to select the builder "
+            f"explicitly."
+        ) from exc
 
 
 def _is_multimodal_processor(processor: Any | None) -> bool:
