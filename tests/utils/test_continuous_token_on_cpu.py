@@ -1782,14 +1782,40 @@ def test_vl_builder_preserves_explicit_sampling_rate_over_processor_default():
     assert builder.mm_processor_kwargs["sampling_rate"] == 24000
 
 
-def test_generation_prompt_delta_render_is_bounded_for_long_histories():
-    tokenizer = _RecordingTemplateTokenizer()
-    builder = create_continuous_token_builder(tokenizer, model_family="default")
+class _RecordingQwenTokenizer(_RecordingTemplateTokenizer, _QwenBoundaryTokenizer):
+    def __init__(self):
+        _RecordingTemplateTokenizer.__init__(self)
+        _QwenBoundaryTokenizer.__init__(self)
 
+
+def _tool_loop_history(turns):
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "question"},
     ]
+    for turn in range(turns):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call-{turn}",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "tool", "content": f"result {turn}", "tool_call_id": f"call-{turn}"})
+    return messages
+
+
+def test_qwen_generation_prompt_delta_render_is_bounded_for_long_histories():
+    tokenizer = _RecordingQwenTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="qwen3")
+
+    messages = _tool_loop_history(0)
     for turn in range(40):
         messages.append(
             {
@@ -1811,8 +1837,21 @@ def test_generation_prompt_delta_render_is_bounded_for_long_histories():
     max_rendered = max(len(call["messages"]) for call in tokenizer.calls)
     assert max_rendered <= 5, (
         f"incremental tokenization rendered {max_rendered} messages in one call; "
-        "renders must stay bounded regardless of history length"
+        "Qwen renders must stay bounded regardless of history length"
     )
+
+
+def test_default_builder_keeps_full_history_generation_prompt_render():
+    tokenizer = _RecordingTemplateTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+
+    messages = _tool_loop_history(3)
+    previous = messages[:-1]
+    builder.tokenize_non_assistant_incremental_messages(previous, messages)
+
+    # The fallback must still derive the generation prompt from the full history.
+    assert len(tokenizer.calls[-1]["messages"]) == len(messages)
+    assert tokenizer.calls[-1]["add_generation_prompt"] is True
 
 
 @pytest.mark.parametrize(
@@ -1828,17 +1867,9 @@ def test_generation_prompt_delta_render_is_bounded_for_long_histories():
         },
     ],
 )
-@pytest.mark.parametrize(
-    ("model_family", "tokenizer_cls"),
-    [
-        ("default", _TemplateTokenizer),
-        ("qwen3", _QwenBoundaryTokenizer),
-        ("minimaxm2", _MiniMaxBoundaryTokenizer),
-        ("glm47", _GLMBoundaryTokenizer),
-    ],
-)
-def test_generation_prompt_delta_matches_full_history_render(model_family, tokenizer_cls, last_message):
-    tokenizer = tokenizer_cls()
+@pytest.mark.parametrize("model_family", ["qwen", "qwen25", "qwen3", "qwen35"])
+def test_qwen_generation_prompt_delta_matches_full_history_render(model_family, last_message):
+    tokenizer = _QwenBoundaryTokenizer()
     builder = create_continuous_token_builder(tokenizer, model_family=model_family)
     conversation = [
         {"role": "system", "content": "sys"},

@@ -250,32 +250,12 @@ class ContinuousTokenBuilder:
     ) -> list[int]:
         """Tokenize the tokens added only by ``add_generation_prompt=True``.
 
-        Renders a bounded pseudo conversation that ends with the same message as
-        the real one instead of the accumulated history. Rendering the full
-        conversation twice per tool turn made tokenization cost quadratic in the
-        number of turns and dominated long agent rollouts (#7617). This mirrors
-        how ``_tokenize_tool_group`` and ``_tokenize_single_non_tool`` already
-        bound their renders, and the Gemma4 builder's existing override.
+        The base implementation renders the full history because some chat
+        templates derive the generation prompt from more than the last message.
+        Builders for verified template families override this with a bounded
+        render (see :class:`QwenContinuousTokenBuilder`).
         """
-        if not updated_messages:
-            return self.render_delta_token_id(
-                [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE],
-                [],
-                add_generation_prompt=True,
-                tools=tools,
-            )
-        last_message = updated_messages[-1]
-        if last_message.get("role") == "tool":
-            # Tool messages need a preceding assistant tool call to render.
-            pseudo_prefix = [
-                _SYNTHETIC_SYSTEM_MESSAGE,
-                _SYNTHETIC_USER_MESSAGE,
-                self._synthetic_assistant_for_tools([last_message]),
-                last_message,
-            ]
-        else:
-            pseudo_prefix = [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE, last_message]
-        return self.render_delta_token_id(pseudo_prefix, [], add_generation_prompt=True, tools=tools)
+        return self.render_delta_token_id(updated_messages, [], add_generation_prompt=True, tools=tools)
 
     def _iter_append_groups(self, appended_messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         groups: list[list[dict[str, Any]]] = []
@@ -492,6 +472,42 @@ class QwenContinuousTokenBuilder(ContinuousTokenBuilder):
             kind="non_assistant",
             inserted_token_ids=inserted_token_ids,
         )
+
+    def _tokenize_generation_prompt_delta(
+        self,
+        updated_messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[int]:
+        """Bounded generation-prompt delta for the Qwen ChatML templates.
+
+        Qwen2.5 / Qwen3 / Qwen3.5 render the generation prompt from the last
+        message only, so a pseudo conversation that ends with the same message
+        yields the same suffix as the accumulated history. Rendering the full
+        history twice per tool turn made tokenization cost quadratic in the
+        number of turns and dominated long agent rollouts (#7617). The base
+        class keeps the full-history render as the fallback for templates that
+        have not been verified.
+        """
+        if not updated_messages:
+            return self.render_delta_token_id(
+                [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE],
+                [],
+                add_generation_prompt=True,
+                tools=tools,
+            )
+        last_message = updated_messages[-1]
+        if last_message.get("role") == "tool":
+            # Tool messages need a preceding assistant tool call to render.
+            pseudo_prefix = [
+                _SYNTHETIC_SYSTEM_MESSAGE,
+                _SYNTHETIC_USER_MESSAGE,
+                self._synthetic_assistant_for_tools([last_message]),
+                last_message,
+            ]
+        else:
+            pseudo_prefix = [_SYNTHETIC_SYSTEM_MESSAGE, _SYNTHETIC_USER_MESSAGE, last_message]
+        return self.render_delta_token_id(pseudo_prefix, [], add_generation_prompt=True, tools=tools)
 
 
 class MiniMaxContinuousTokenBuilder(ContinuousTokenBuilder):
@@ -1006,6 +1022,16 @@ class MiniMaxVLContinuousTokenBuilder(VLContinuousTokenMixin, MiniMaxContinuousT
     auto-appended scaffold when ``add_generation_prompt=False`` and keep it when
     ``True`` (where it legitimately is the generation prompt).
     """
+
+    def _tokenize_generation_prompt_delta(
+        self,
+        updated_messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[int]:
+        # The VL templates have not been verified for last-message-only
+        # generation prompts yet; keep the full-history fallback.
+        return ContinuousTokenBuilder._tokenize_generation_prompt_delta(self, updated_messages, tools=tools)
 
     def __init__(self, tokenizer: Any, processor: Any, **kwargs: Any):
         super().__init__(tokenizer, processor, **kwargs)
