@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -28,9 +29,28 @@ _SYNTHETIC_USER_MESSAGE: dict[str, Any] = {"role": "user", "content": "continuou
 _ASSISTANT_REASONING_CONTENT: str = "reasoning"
 _DUMMY_TOOL_NAME = "continuous_token_tool"
 MergeKind = Literal["assistant", "non_assistant"]
+# (role of the final message, tool schema fingerprint)
+_GenerationPromptCacheKey = tuple[str | None, str]
+# Uses that always re-render the generation-prompt delta before the cache is
+# trusted; after them re-validation is exponentially spaced.
+_GENERATION_PROMPT_DELTA_WARMUP_USES = 4
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
+
+
+def _tools_fingerprint(tools: list[dict[str, Any]] | None) -> str:
+    """Stable text for a tool schema list, cheap next to a chat-template render."""
+    if not tools:
+        return ""
+    try:
+        return json.dumps(tools, sort_keys=True, default=repr)
+    except (TypeError, ValueError):
+        return repr(tools)
 
 
 @dataclass(frozen=True)
@@ -68,12 +88,15 @@ class ContinuousTokenBuilder:
         Model-specific builders should subclass this class and keep the runtime
         API contracts above stable. Chat template specific behavior belongs in hooks
         such as ``_tokenize_tool_group``, ``_tokenize_single_non_tool``,
-        ``_tokenize_generation_prompt_delta``, and ``_merge_non_assistant_token_ids``.
+        ``_render_generation_prompt_delta``, and ``_merge_non_assistant_token_ids``.
         ``render_delta_token_id`` is the shared suffix-diff helper those hooks can
         reuse.
     """
 
     allowed_append_roles: frozenset[str] = _SUPPORTED_APPEND_ROLES
+    # Builders whose renders have not been checked with the cache keep rendering
+    # the generation-prompt delta on every call.
+    cache_generation_prompt_delta: bool = True
 
     def __init__(
         self,
@@ -87,6 +110,10 @@ class ContinuousTokenBuilder:
         # layer so a text builder never carries multimodal parameters it cannot use.
         self.tokenizer = tokenizer
         self.chat_template_kwargs = chat_template_kwargs or {}
+        # Generation-prompt delta cache; see ``_tokenize_generation_prompt_delta``.
+        self._generation_prompt_delta_cache: dict[_GenerationPromptCacheKey, list[int]] = {}
+        self._generation_prompt_delta_uses: dict[_GenerationPromptCacheKey, int] = {}
+        self._generation_prompt_delta_unstable: set[_GenerationPromptCacheKey] = set()
         if allowed_append_roles is not None:
             allowed_roles = frozenset(allowed_append_roles)
             unknown_roles = allowed_roles - _SUPPORTED_APPEND_ROLES
@@ -248,7 +275,80 @@ class ContinuousTokenBuilder:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> list[int]:
-        """Tokenize the tokens added only by ``add_generation_prompt=True``."""
+        """Tokenize the tokens added only by ``add_generation_prompt=True``.
+
+        The delta is cached per (final message role, tools). Every one of the
+        first ``_GENERATION_PROMPT_DELTA_WARMUP_USES`` uses re-renders and
+        compares, and after that re-validation happens at exponentially spaced
+        uses, so a rollout pays for O(log n) renders instead of one per turn.
+        On the first disagreement the key is marked unstable and every later
+        turn renders in full, which keeps templates that derive the generation
+        prompt from more than the last message correct.
+        """
+        if not self.cache_generation_prompt_delta:
+            return self._render_generation_prompt_delta(updated_messages, tools=tools)
+        key = self._generation_prompt_delta_cache_key(updated_messages, tools)
+        if key in self._generation_prompt_delta_unstable:
+            return self._render_generation_prompt_delta(updated_messages, tools=tools)
+
+        uses = self._generation_prompt_delta_uses.get(key, 0) + 1
+        self._generation_prompt_delta_uses[key] = uses
+        cached = self._generation_prompt_delta_cache.get(key)
+        if cached is not None and not self._should_revalidate_generation_prompt_delta(uses):
+            return list(cached)
+
+        rendered = self._render_generation_prompt_delta(updated_messages, tools=tools)
+        if cached is not None and rendered != cached:
+            self._generation_prompt_delta_unstable.add(key)
+            self._generation_prompt_delta_cache.pop(key, None)
+            logger.warning(
+                "Continuous Token generation-prompt delta changed for %r after %d uses; "
+                "this chat template renders it from more than the last message, "
+                "rendering it in full from now on",
+                key[0],
+                uses,
+            )
+            return rendered
+        self._generation_prompt_delta_cache[key] = list(rendered)
+        return rendered
+
+    def _should_revalidate_generation_prompt_delta(self, uses: int) -> bool:
+        """Re-render on the warm-up uses, then at exponentially spaced ones.
+
+        The warm-up catches templates whose generation prompt starts moving as
+        soon as the history grows; the exponential tail keeps catching later
+        drift at a cost that vanishes over a long rollout.
+        """
+        return uses <= _GENERATION_PROMPT_DELTA_WARMUP_USES or _is_power_of_two(uses)
+
+    def _generation_prompt_delta_cache_key(
+        self,
+        updated_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> _GenerationPromptCacheKey:
+        """Cache key for the generation-prompt delta.
+
+        The role of the final message and the tool schemas are the inputs a
+        chat template is expected to derive the generation prompt from;
+        anything beyond them is caught by re-validation rather than by the key.
+        """
+        role = updated_messages[-1].get("role") if updated_messages else None
+        return role, _tools_fingerprint(tools)
+
+    def _render_generation_prompt_delta(
+        self,
+        updated_messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> list[int]:
+        """Render the generation-prompt delta, uncached.
+
+        The base implementation renders the full history because some chat
+        templates derive the generation prompt from more than the last message.
+        Builders with template-specific behaviour override this hook (see
+        :class:`Gemma4ContinuousTokenBuilder`); the cache in
+        ``_tokenize_generation_prompt_delta`` wraps whichever is in place.
+        """
         return self.render_delta_token_id(updated_messages, [], add_generation_prompt=True, tools=tools)
 
     def _iter_append_groups(self, appended_messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -581,7 +681,7 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
             tools=tools,
         )
 
-    def _tokenize_generation_prompt_delta(
+    def _render_generation_prompt_delta(
         self,
         updated_messages: list[dict[str, Any]],
         *,
@@ -797,6 +897,10 @@ class VLContinuousTokenMixin:
     via Python MRO so that boundary handling like Qwen's newline insertion or
     GLM's observation/user trim still applies through ``_merge_non_assistant_token_ids``.
     """
+
+    # Processor-backed renders have not been checked with the cache yet; VL
+    # builders keep rendering the generation-prompt delta on every call.
+    cache_generation_prompt_delta = False
 
     def __init__(
         self,
