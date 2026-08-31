@@ -672,10 +672,19 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         )
 
 
+class MissingRequiredTokenError(ValueError):
+    """A special token a model-specific builder depends on is absent from the tokenizer.
+
+    Raised at builder construction. Checkpoints that pair a registered architecture
+    with another vendor's tokenizer hit this — the DeepSeek-R1 distills keep Qwen
+    ``model_type`` values but rename ``<|im_end|>`` away.
+    """
+
+
 def require_token_id(tokenizer: Any, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None:
-        raise ValueError(f"Tokenizer does not define required token {token!r}")
+        raise MissingRequiredTokenError(f"Tokenizer does not define required token {token!r}")
     if isinstance(token_id, list):
         if len(token_id) != 1:
             raise ValueError(f"Tokenizer returned multiple ids for required token {token!r}: {token_id!r}")

@@ -32,6 +32,7 @@ from .continuous_token import (
     KimiVLContinuousTokenBuilder,
     MiniMaxContinuousTokenBuilder,
     MiniMaxVLContinuousTokenBuilder,
+    MissingRequiredTokenError,
     QwenContinuousTokenBuilder,
     QwenVLContinuousTokenBuilder,
     VLContinuousTokenBuilder,
@@ -307,7 +308,61 @@ def create_continuous_token_builder(
             f"Ensure the processor is loaded for vision-language models."
         )
     logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-    return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    try:
+        return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    except MissingRequiredTokenError as exc:
+        if _normalize_model_family(model_family) != ContinuousTokenModelFamily.AUTO:
+            raise
+        # The inferred builder cannot work with this tokenizer: the checkpoint pairs a
+        # registered architecture with another vendor's tokenizer. Fall back to an exact
+        # special-token lookup on the tokenizer itself, which identifies such
+        # checkpoints (the DeepSeek-R1 distills keep Qwen model_type values but ship
+        # DeepSeek's tokenizer and chat template).
+        token_family = _family_from_tokenizer_special_tokens(tokenizer)
+        if token_family is None:
+            raise
+        token_builder_cls = get_continuous_token_builder_class(token_family)
+        logger.warning(
+            "%s inferred from config.json model_type=%r cannot be constructed (%s); "
+            "the tokenizer's special tokens exactly match family %s, using %s instead.",
+            builder_cls.__name__,
+            _normalize_hf_model_type(hf_model_type),
+            exc,
+            token_family,
+            token_builder_cls.__name__,
+        )
+        return token_builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+
+
+# The DeepSeek chat lineage renames ChatML's ``<|im_end|>`` away and defines these
+# role/eos markers instead. Reusing the builder's own constants keeps the key aligned
+# with what DeepSeekContinuousTokenBuilder validates at construction.
+_DEEPSEEK_TOKENIZER_KEY_TOKENS = (
+    DeepSeekContinuousTokenBuilder._EOS_TOKEN,
+    DeepSeekContinuousTokenBuilder._ASSISTANT_TOKEN,
+)
+_CHATML_IM_END_TOKEN = "<|im_end|>"
+
+
+def _family_from_tokenizer_special_tokens(tokenizer: Any) -> ContinuousTokenModelFamily | None:
+    """Exact special-token key for tokenizers that identify a family themselves.
+
+    Only consulted when the builder inferred from ``model_type`` cannot be
+    constructed. Matching is exact on token presence; nothing is guessed from
+    repository or tokenizer names.
+    """
+    if all(
+        _tokenizer_defines_token(tokenizer, token) for token in _DEEPSEEK_TOKENIZER_KEY_TOKENS
+    ) and not _tokenizer_defines_token(tokenizer, _CHATML_IM_END_TOKEN):
+        return ContinuousTokenModelFamily.DEEPSEEK
+    return None
+
+
+def _tokenizer_defines_token(tokenizer: Any, token: str) -> bool:
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if token_id is None:
+        return False
+    return token_id != getattr(tokenizer, "unk_token_id", None)
 
 
 def _is_multimodal_processor(processor: Any | None) -> bool:
