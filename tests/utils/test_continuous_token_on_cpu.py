@@ -2018,3 +2018,64 @@ def test_vl_builders_keep_rendering_the_generation_prompt_delta():
     # been checked with the cache.
     assert builder._generation_prompt_delta_cache == {}
     assert builder._generation_prompt_delta_uses == {}
+
+
+class _RecordingGemma4Tokenizer(_RecordingTemplateTokenizer, _Gemma4BoundaryTokenizer):
+    def __init__(self):
+        _RecordingTemplateTokenizer.__init__(self)
+        _Gemma4BoundaryTokenizer.__init__(self)
+
+    def apply_chat_template(
+        self, messages, tokenize=True, add_generation_prompt=True, tools=None, return_dict=False, **kwargs
+    ):
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "add_generation_prompt": add_generation_prompt,
+                "tools": tools,
+                "kwargs": dict(kwargs),
+            }
+        )
+        return _Gemma4BoundaryTokenizer.apply_chat_template(
+            self,
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+
+def test_gemma4_keeps_its_generation_prompt_render_through_the_cache():
+    tokenizer = _RecordingGemma4Tokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="gemma4")
+    assert isinstance(builder, Gemma4ContinuousTokenBuilder)
+    assert builder.cache_generation_prompt_delta is True
+
+    # Gemma4 renders no generation prompt after a tool response ...
+    tool_final = _tool_loop_history(3)
+    assert builder._tokenize_generation_prompt_delta(tool_final) == []
+    assert builder._generation_prompt_delta_cache[("tool", "")] == []
+
+    # ... and derives it from the last message alone after a user turn; the
+    # cached value is that override's output, not a full-history render.
+    user_final = tool_final + [{"role": "user", "content": "follow-up"}]
+    expected = tokenizer.encode("<assistant>", add_special_tokens=False)
+    assert builder._render_generation_prompt_delta(user_final) == expected
+    assert builder._tokenize_generation_prompt_delta(user_final) == expected
+    assert builder._generation_prompt_delta_cache[("user", "")] == expected
+    assert all(len(call["messages"]) <= 3 for call in tokenizer.calls), (
+        "Gemma4's override renders a bounded pseudo conversation; the cache must not replace it with a full render"
+    )
+
+    # Later uses are served from the cache and stay correct.
+    calls_before = len(tokenizer.calls)
+    for _ in range(20):
+        assert (
+            builder._tokenize_generation_prompt_delta(
+                user_final + [{"role": "assistant", "content": "a"}, user_final[-1]]
+            )
+            == expected
+        )
+    assert len(tokenizer.calls) - calls_before < 20
