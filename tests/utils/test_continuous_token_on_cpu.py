@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 
 import pytest
@@ -20,6 +21,7 @@ from verl.utils.tokenizer.continuous_token import (
     ContinuousTokenBuilder,
     DeepSeekContinuousTokenBuilder,
     DeepSeekVL2ContinuousTokenBuilder,
+    FallbackContinuousTokenBuilder,
     Gemma4ContinuousTokenBuilder,
     GLM46VContinuousTokenBuilder,
     GLMContinuousTokenBuilder,
@@ -276,6 +278,26 @@ class _DeepSeekBoundaryTokenizer(_TemplateTokenizer):
         return rendered
 
 
+class _DistillTokenizer(_DeepSeekBoundaryTokenizer):
+    """DeepSeek-R1 distill of Qwen: the root config keeps a Qwen ``model_type`` but the
+    checkpoint ships DeepSeek's tokenizer and chat template, in which ``<|im_end|>``
+    does not exist (renamed to ``<｜end▁of▁sentence｜>``)."""
+
+    name_or_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    unk_token_id = None
+
+    def __init__(self):
+        super().__init__()
+        self.assistant_id = 2
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<｜end▁of▁sentence｜>":
+            return self.eos_id
+        if token == "<｜Assistant｜>":
+            return self.assistant_id
+        return None
+
+
 class _MissingSpecialTokenTokenizer(_TemplateTokenizer):
     def convert_tokens_to_ids(self, token):
         return None
@@ -468,6 +490,38 @@ def test_unknown_model_with_non_multimodal_processor_uses_default_text_builder(c
     assert isinstance(builder, ContinuousTokenBuilder)
     assert "unknown_text_model" in caplog.text
     assert "default" in caplog.text
+
+
+def test_auto_family_falls_back_to_default_builder_when_a_required_token_is_missing(caplog):
+    tokenizer = _DistillTokenizer()
+    with caplog.at_level(logging.WARNING, logger="verl.utils.tokenizer.continuous_token_wiring"):
+        builder = create_continuous_token_builder(tokenizer, hf_model_type="qwen2")
+
+    assert type(builder) is FallbackContinuousTokenBuilder
+    assert "QwenContinuousTokenBuilder" in caplog.text
+    assert "<|im_end|>" in caplog.text
+    assert "falling back to the default builder" in caplog.text
+
+    # The fallback must also render the distill's DeepSeek-style template: tool
+    # appends splice the synthetic call's arguments in by string concatenation.
+    previous_messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_0", "type": "function", "function": {"name": "lookup", "arguments": {"q": "x"}}}
+            ],
+        },
+    ]
+    updated_messages = previous_messages + [{"role": "tool", "content": "answer", "tool_call_id": "call_0"}]
+    incremental = builder.tokenize_non_assistant_incremental_messages(previous_messages, updated_messages)
+    assert incremental == [ord(char) for char in "<tool_output_begin>answer<tool_output_end>"]
+
+
+def test_explicit_family_does_not_fall_back_when_a_required_token_is_missing():
+    with pytest.raises(ValueError, match="required token '<\\|im_end\\|>'"):
+        create_continuous_token_builder(_DistillTokenizer(), model_family="qwen")
 
 
 def test_default_builder_creation_forwards_kwargs():
@@ -665,6 +719,23 @@ def test_deepseek_builder_synthetic_tool_call_arguments_are_a_json_string():
 
     assert [tool_call["id"] for tool_call in synthetic_assistant["tool_calls"]] == ["call_0", "call_1"]
     assert all(tool_call["function"]["arguments"] == "{}" for tool_call in synthetic_assistant["tool_calls"])
+
+
+def test_fallback_builder_synthetic_tool_call_arguments_are_a_json_string():
+    synthetic_assistant = FallbackContinuousTokenBuilder(_TemplateTokenizer())._synthetic_assistant_for_tools(
+        [{"role": "tool", "content": "out", "tool_call_id": "call_0", "name": "lookup"}]
+    )
+
+    arguments = synthetic_assistant["tool_calls"][0]["function"]["arguments"]
+    assert arguments == "{}"
+    assert json.loads(arguments) == {}
+
+    # The base builder keeps the mapping form: registered templates like Qwen3.5,
+    # MiniMax-M2 and GLM-4.7 render the synthetic arguments with ``.items()``.
+    base_assistant = ContinuousTokenBuilder(_TemplateTokenizer())._synthetic_assistant_for_tools(
+        [{"role": "tool", "content": "out", "tool_call_id": "call_0", "name": "lookup"}]
+    )
+    assert base_assistant["tool_calls"][0]["function"]["arguments"] == {}
 
 
 def test_gpt_oss_builder_formats_tool_responses_with_resolved_tool_name():

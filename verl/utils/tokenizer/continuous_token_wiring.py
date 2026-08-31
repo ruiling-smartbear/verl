@@ -24,6 +24,7 @@ from .continuous_token import (
     ContinuousTokenBuilder,
     DeepSeekContinuousTokenBuilder,
     DeepSeekVL2ContinuousTokenBuilder,
+    FallbackContinuousTokenBuilder,
     Gemma4ContinuousTokenBuilder,
     Gemma4VLContinuousTokenBuilder,
     GLM46VContinuousTokenBuilder,
@@ -32,6 +33,7 @@ from .continuous_token import (
     KimiVLContinuousTokenBuilder,
     MiniMaxContinuousTokenBuilder,
     MiniMaxVLContinuousTokenBuilder,
+    MissingRequiredTokenError,
     QwenContinuousTokenBuilder,
     QwenVLContinuousTokenBuilder,
     VLContinuousTokenBuilder,
@@ -307,7 +309,26 @@ def create_continuous_token_builder(
             f"Ensure the processor is loaded for vision-language models."
         )
     logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-    return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    try:
+        return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
+    except MissingRequiredTokenError as exc:
+        requested_family = _normalize_model_family(model_family)
+        if requested_family != ContinuousTokenModelFamily.AUTO or builder_cls is ContinuousTokenBuilder:
+            raise
+        # The inferred builder cannot work with this tokenizer: the checkpoint pairs a
+        # registered architecture with another vendor's tokenizer (the DeepSeek-R1
+        # distills keep Qwen model_type values but rename ``<|im_end|>`` away). Give
+        # such checkpoints the treatment an unregistered model_type already gets,
+        # through the fallback subclass whose synthetic tool-call arguments fit
+        # their string-concatenating templates.
+        logger.warning(
+            "%s inferred from config.json model_type=%r cannot be constructed (%s); "
+            "falling back to the default builder (FallbackContinuousTokenBuilder).",
+            builder_cls.__name__,
+            _normalize_hf_model_type(hf_model_type),
+            exc,
+        )
+        return FallbackContinuousTokenBuilder(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
 
 
 def _is_multimodal_processor(processor: Any | None) -> bool:

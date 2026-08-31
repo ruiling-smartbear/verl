@@ -672,10 +672,19 @@ class Gemma4ContinuousTokenBuilder(ContinuousTokenBuilder):
         )
 
 
+class MissingRequiredTokenError(ValueError):
+    """A special token a model-specific builder depends on is absent from the tokenizer.
+
+    Raised at builder construction. Checkpoints that pair a registered architecture
+    with another vendor's tokenizer hit this — the DeepSeek-R1 distills keep Qwen
+    ``model_type`` values but rename ``<|im_end|>`` away.
+    """
+
+
 def require_token_id(tokenizer: Any, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None:
-        raise ValueError(f"Tokenizer does not define required token {token!r}")
+        raise MissingRequiredTokenError(f"Tokenizer does not define required token {token!r}")
     if isinstance(token_id, list):
         if len(token_id) != 1:
             raise ValueError(f"Tokenizer returned multiple ids for required token {token!r}: {token_id!r}")
@@ -832,6 +841,27 @@ class DeepSeekContinuousTokenBuilder(ContinuousTokenBuilder):
             appended_token_count=len(appended_token_ids),
             kind="non_assistant",
         )
+
+
+class FallbackContinuousTokenBuilder(ContinuousTokenBuilder):
+    """Default-builder fallback for checkpoints whose inferred builder cannot construct.
+
+    The base class carries the synthetic tool-call arguments as a mapping because
+    registered templates like Qwen3.5, MiniMax-M2 and GLM-4.7 render them with
+    ``.items()``. The checkpoints known to need this fallback (the DeepSeek-R1
+    distills of Qwen) instead splice ``function['arguments']`` into the prompt by
+    string concatenation, so this subclass carries the JSON string form, as
+    ``DeepSeekContinuousTokenBuilder`` does (#7630).
+    """
+
+    def _synthetic_assistant_for_tools(
+        self,
+        tool_messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        synthetic_assistant = super()._synthetic_assistant_for_tools(tool_messages)
+        for tool_call in synthetic_assistant["tool_calls"]:
+            tool_call["function"]["arguments"] = "{}"
+        return synthetic_assistant
 
 
 # =============================================================================
