@@ -17,6 +17,7 @@ import logging
 import pytest
 
 from verl.utils.tokenizer.continuous_token import (
+    _GENERATION_PROMPT_DELTA_WARMUP_USES,
     ContinuousTokenBuilder,
     DeepSeekContinuousTokenBuilder,
     DeepSeekVL2ContinuousTokenBuilder,
@@ -29,6 +30,7 @@ from verl.utils.tokenizer.continuous_token import (
     MiniMaxContinuousTokenBuilder,
     QwenContinuousTokenBuilder,
     QwenVLContinuousTokenBuilder,
+    _tools_fingerprint,
 )
 from verl.utils.tokenizer.continuous_token_wiring import (
     CONTINUOUS_TOKEN_BUILDER_FAMILIES,
@@ -1895,3 +1897,146 @@ def test_qwen_generation_prompt_delta_matches_full_history_render(model_family, 
     full_history = builder.render_delta_token_id(conversation, [], add_generation_prompt=True, tools=tools)
 
     assert bounded == full_history
+
+
+class _HistoryDependentGenerationPromptTokenizer(_TemplateTokenizer):
+    """Renders the generation prompt from the whole history, not the last turn.
+
+    ``changes_after`` renders that make the prompt stable are served first, so a
+    template that only starts drifting later in a rollout is covered too.
+    """
+
+    def __init__(self, changes_after=0):
+        self.changes_after = changes_after
+        self.generation_prompt_renders = 0
+
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        tools=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        rendered = "".join(f"<{message['role']}>{message.get('content', '')}\n" for message in messages)
+        if add_generation_prompt:
+            self.generation_prompt_renders += 1
+            marker = len(messages) if self.generation_prompt_renders > self.changes_after else 0
+            rendered += f"<assistant turn={marker}>"
+        if tokenize:
+            return self.encode(rendered, add_special_tokens=False)
+        return rendered
+
+
+def _drive_tool_loop(builder, turns):
+    """Append one assistant tool call plus one tool response per turn."""
+    messages = _tool_loop_history(0)
+    for turn in range(turns):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call-{turn}",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            }
+        )
+        previous = list(messages)
+        messages.append({"role": "tool", "content": f"result {turn}", "tool_call_id": f"call-{turn}"})
+        builder.tokenize_non_assistant_incremental_messages(previous, messages)
+    return messages
+
+
+def test_generation_prompt_delta_cache_stops_rendering_every_turn():
+    tokenizer = _RecordingTemplateTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+
+    _drive_tool_loop(builder, 32)
+
+    generation_prompt_calls = [call for call in tokenizer.calls if call["add_generation_prompt"]]
+    # 32 turns: warm-up 1..4 plus re-validation at 8, 16 and 32. The assertion
+    # below is deliberately loose; what matters is that it does not grow with
+    # the number of turns.
+    assert len(generation_prompt_calls) <= 10, (
+        f"cached generation prompt still rendered {len(generation_prompt_calls)} times over 32 turns"
+    )
+
+
+def test_generation_prompt_delta_cache_returns_the_rendered_delta():
+    cached_tokenizer = _TemplateTokenizer()
+    uncached_tokenizer = _TemplateTokenizer()
+    cached = create_continuous_token_builder(cached_tokenizer, model_family="default")
+    uncached = create_continuous_token_builder(uncached_tokenizer, model_family="default")
+
+    messages = _tool_loop_history(0)
+    for turn in range(20):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"call-{turn}",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": {}},
+                    }
+                ],
+            }
+        )
+        previous = list(messages)
+        messages.append({"role": "tool", "content": f"result {turn}", "tool_call_id": f"call-{turn}"})
+
+        assert cached.tokenize_non_assistant_incremental_messages(previous, messages) == uncached._tokenize_tool_group(
+            messages[len(previous) :], previous_messages=previous
+        ) + uncached._render_generation_prompt_delta(messages)
+
+
+def test_generation_prompt_delta_cache_falls_back_when_the_template_drifts(caplog):
+    tokenizer = _HistoryDependentGenerationPromptTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+
+    with caplog.at_level(logging.WARNING):
+        messages = _drive_tool_loop(builder, 6)
+
+    key = builder._generation_prompt_delta_cache_key(messages, None)
+    assert key in builder._generation_prompt_delta_unstable
+    assert key not in builder._generation_prompt_delta_cache
+    assert "rendering it in full from now on" in caplog.text
+    # Once unstable the delta is rendered from the full history again.
+    assert builder._tokenize_generation_prompt_delta(messages) == builder._render_generation_prompt_delta(messages)
+
+
+def test_generation_prompt_delta_cache_catches_drift_after_the_warm_up():
+    # Stable for the four warm-up renders, then history dependent: the drift is
+    # caught by the first re-validation past the warm-up rather than never.
+    tokenizer = _HistoryDependentGenerationPromptTokenizer(changes_after=_GENERATION_PROMPT_DELTA_WARMUP_USES)
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+
+    messages = _drive_tool_loop(builder, 16)
+
+    key = builder._generation_prompt_delta_cache_key(messages, None)
+    assert key in builder._generation_prompt_delta_unstable
+    assert builder._generation_prompt_delta_uses[key] > _GENERATION_PROMPT_DELTA_WARMUP_USES
+    assert builder._tokenize_generation_prompt_delta(messages) == builder._render_generation_prompt_delta(messages)
+
+
+def test_generation_prompt_delta_cache_separates_roles_and_tools():
+    tokenizer = _TemplateTokenizer()
+    builder = create_continuous_token_builder(tokenizer, model_family="default")
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    history = _tool_loop_history(2)
+
+    builder._tokenize_generation_prompt_delta(history)
+    builder._tokenize_generation_prompt_delta(history + [{"role": "user", "content": "follow-up"}])
+    builder._tokenize_generation_prompt_delta(history, tools=tools)
+
+    assert set(builder._generation_prompt_delta_cache) == {
+        ("tool", ""),
+        ("user", ""),
+        ("tool", _tools_fingerprint(tools)),
+    }
