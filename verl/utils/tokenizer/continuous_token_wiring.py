@@ -252,6 +252,34 @@ def create_continuous_token_builder(
     )
     builder_cls = get_continuous_token_builder_class(resolved_family)
 
+    def _construct(cls: type[Any], *args: Any, **extra: Any) -> Any:
+        """Construct ``cls``, rewriting a missing-token failure into an actionable error.
+
+        Every construction goes through here: a VL builder validates special tokens the
+        same way a text builder does, so a vision checkpoint whose tokenizer does not
+        match its architecture must get the same guidance instead of a bare lookup error.
+        """
+        try:
+            return cls(tokenizer, *args, **extra, **builder_kwargs)
+        except MissingRequiredTokenError as exc:
+            if _normalize_model_family(model_family) != ContinuousTokenModelFamily.AUTO:
+                raise
+            # The builder inferred from the architecture cannot work with this tokenizer:
+            # the checkpoint pairs a registered model_type with a tokenizer and chat
+            # template that builder does not support. Point the user at the explicit
+            # override, since the builder has to follow the chat template's conversation
+            # protocol, not the architecture. Which family to name is derived from this
+            # tokenizer rather than assumed -- every model-specific builder validates
+            # special tokens at construction, so any registered architecture can land
+            # here, not only the DeepSeek-R1 distills.
+            raise MissingRequiredTokenError(
+                f"{cls.__name__}, inferred from config.json model_type="
+                f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. This "
+                f"checkpoint pairs a registered architecture with a tokenizer and chat template "
+                f"that builder does not support. "
+                + _model_family_override_hint(tokenizer, has_multimodal_processor=has_mm_processor)
+            ) from exc
+
     if has_mm_processor:
         # --- Vision-language run ---
         # mm_processor_kwargs is a multimodal-only concern, so (like ``processor``) it
@@ -259,12 +287,11 @@ def create_continuous_token_builder(
         if builder_cls.supports_multimodal():
             # The root model_type identified a model-specific VL family.
             logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-            return builder_cls(
-                tokenizer,
+            return _construct(
+                builder_cls,
                 processor,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_processor_kwargs=mm_processor_kwargs,
-                **builder_kwargs,
             )
 
         # Inferred a text family, but a multimodal processor is present. Only
@@ -286,12 +313,11 @@ def create_continuous_token_builder(
             resolved_family = upgraded_family
             builder_cls = get_continuous_token_builder_class(resolved_family)
             logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-            return builder_cls(
-                tokenizer,
+            return _construct(
+                builder_cls,
                 processor,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_processor_kwargs=mm_processor_kwargs,
-                **builder_kwargs,
             )
 
         raise ValueError(
@@ -308,25 +334,7 @@ def create_continuous_token_builder(
             f"Ensure the processor is loaded for vision-language models."
         )
     logger.info("Creating Continuous Token builder: family=%s class=%s", resolved_family, builder_cls)
-    try:
-        return builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs, **builder_kwargs)
-    except MissingRequiredTokenError as exc:
-        if _normalize_model_family(model_family) != ContinuousTokenModelFamily.AUTO:
-            raise
-        # The builder inferred from the architecture cannot work with this tokenizer: the
-        # checkpoint pairs a registered model_type with a tokenizer and chat template that
-        # builder does not support. Point the user at the explicit override, since the
-        # builder has to follow the chat template's conversation protocol, not the
-        # architecture. Which family to name is derived from this tokenizer rather than
-        # assumed -- every model-specific builder validates special tokens at construction,
-        # so any registered architecture can land here, not only the DeepSeek-R1 distills.
-        raise MissingRequiredTokenError(
-            f"{builder_cls.__name__}, inferred from config.json model_type="
-            f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. This "
-            f"checkpoint pairs a registered architecture with a tokenizer and chat template "
-            f"that builder does not support. "
-            + _model_family_override_hint(tokenizer, has_multimodal_processor=has_mm_processor)
-        ) from exc
+    return _construct(builder_cls, chat_template_kwargs=chat_template_kwargs)
 
 
 def _model_family_override_hint(tokenizer: Any, *, has_multimodal_processor: bool) -> str:
@@ -345,11 +353,12 @@ def _model_family_override_hint(tokenizer: Any, *, has_multimodal_processor: boo
             f"data.continuous_token.model_family={suggested.value} to select "
             f"{get_continuous_token_builder_class(suggested).__name__} explicitly."
         )
+    generic = ContinuousTokenModelFamily.VL_DEFAULT if has_multimodal_processor else ContinuousTokenModelFamily.DEFAULT
     return (
         f"This tokenizer's special tokens do not identify a family. Set "
         f"data.continuous_token.model_family to the family whose builder implements this "
         f"checkpoint's chat template -- the conversation protocol, not the architecture -- "
-        f"or to 'default' for plain concatenation. Families available on this path: "
+        f"or to {generic.value!r} for plain concatenation. Families available on this path: "
         f"{', '.join(_families_for_path(has_multimodal_processor=has_multimodal_processor))}."
     )
 
