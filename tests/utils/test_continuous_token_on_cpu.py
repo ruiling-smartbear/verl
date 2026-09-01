@@ -497,7 +497,28 @@ def test_auto_family_construction_error_points_at_the_model_family_override():
     message = str(excinfo.value)
     assert "required token '<|im_end|>'" in message
     assert "data.continuous_token.model_family" in message
-    assert "deepseek" in message
+    # Named because this tokenizer's special tokens identify the family, not because
+    # the distills are assumed to be the only checkpoints that reach this branch.
+    assert "match family 'deepseek'" in message
+    assert "model_family=deepseek" in message
+
+
+def test_auto_family_construction_error_does_not_assume_deepseek():
+    """Every model-specific builder validates special tokens, so any registered
+    architecture can fail construction. A GLM checkpoint must not be told to set
+    ``deepseek``, which would fail the same way.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        create_continuous_token_builder(_MissingSpecialTokenTokenizer(), hf_model_type="glm4_moe")
+
+    message = str(excinfo.value)
+    assert "GLMContinuousTokenBuilder" in message
+    assert "required token '<|observation|>'" in message
+    assert "data.continuous_token.model_family" in message
+    assert "deepseek" not in message
+    # Suggestions are the families that actually construct with this tokenizer, with
+    # the catch-all last rather than presented as a match.
+    assert message.rstrip(".").endswith("default")
 
 
 def test_explicit_model_family_override_selects_the_matching_builder():

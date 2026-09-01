@@ -314,19 +314,109 @@ def create_continuous_token_builder(
         if _normalize_model_family(model_family) != ContinuousTokenModelFamily.AUTO:
             raise
         # The builder inferred from the architecture cannot work with this tokenizer: the
-        # checkpoint pairs a registered model_type with another vendor's tokenizer and chat
-        # template (the DeepSeek-R1 distills keep Qwen model_type values but rename
-        # ``<|im_end|>`` away). Point the user at the explicit override, since the builder
-        # has to follow the chat template's conversation protocol, not the architecture.
+        # checkpoint pairs a registered model_type with a tokenizer and chat template that
+        # builder does not support. Point the user at the explicit override, since the
+        # builder has to follow the chat template's conversation protocol, not the
+        # architecture. Which family to name is derived from this tokenizer rather than
+        # assumed -- every model-specific builder validates special tokens at construction,
+        # so any registered architecture can land here, not only the DeepSeek-R1 distills.
         raise MissingRequiredTokenError(
             f"{builder_cls.__name__}, inferred from config.json model_type="
-            f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. The "
-            f"checkpoint pairs this architecture with another vendor's tokenizer and chat "
-            f"template (the DeepSeek-R1 distills of Qwen ship DeepSeek's, which rename "
-            f"<|im_end|> away). Set data.continuous_token.model_family to the family matching "
-            f"the chat template (deepseek for these checkpoints) to select the builder "
-            f"explicitly."
+            f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. This "
+            f"checkpoint pairs a registered architecture with a tokenizer and chat template "
+            f"that builder does not support. "
+            + _model_family_override_hint(tokenizer, chat_template_kwargs, builder_cls)
         ) from exc
+
+
+def _model_family_override_hint(
+    tokenizer: Any,
+    chat_template_kwargs: dict[str, Any] | None,
+    failed_builder_cls: type[Any],
+) -> str:
+    """Name the family to set, derived from the tokenizer instead of assumed."""
+    suggested = _family_from_tokenizer_special_tokens(tokenizer)
+    if suggested is not None:
+        return (
+            f"This tokenizer's special tokens exactly match family {suggested.value!r}; set "
+            f"data.continuous_token.model_family={suggested.value} to select "
+            f"{get_continuous_token_builder_class(suggested).__name__} explicitly."
+        )
+    candidates = _constructible_text_families(tokenizer, chat_template_kwargs, exclude=failed_builder_cls)
+    if candidates:
+        return (
+            f"Set data.continuous_token.model_family to the family whose builder matches this "
+            f"checkpoint's chat template; these construct with this tokenizer: "
+            f"{', '.join(candidates)}."
+        )
+    return (
+        f"Set data.continuous_token.model_family to the family whose builder matches this "
+        f"checkpoint's chat template. Supported families: {', '.join(CONTINUOUS_TOKEN_BUILDER_FAMILIES)}."
+    )
+
+
+def _constructible_text_families(
+    tokenizer: Any,
+    chat_template_kwargs: dict[str, Any] | None,
+    *,
+    exclude: type[Any],
+) -> list[str]:
+    """Text families whose builder accepts this tokenizer, one name per builder class.
+
+    Only consulted to write the error above. Construction is a special-token lookup with
+    no side effects, so trying every family is cheap and, unlike a fixed suggestion, can
+    never name a family that fails the same way. ``default`` is listed last because it
+    accepts any tokenizer and is therefore the generic answer, not evidence of a match.
+    """
+    candidates: list[str] = []
+    seen_classes: set[type[Any]] = {exclude}
+    for family, builder_cls in _CONTINUOUS_TOKEN_BUILDER_REGISTRY.items():
+        if builder_cls in seen_classes or builder_cls.supports_multimodal():
+            continue
+        try:
+            builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs)
+        except Exception:
+            continue
+        seen_classes.add(builder_cls)
+        candidates.append(family.value)
+    default_family = ContinuousTokenModelFamily.DEFAULT.value
+    if default_family in candidates:
+        candidates.remove(default_family)
+        candidates.append(default_family)
+    return candidates
+
+
+# The DeepSeek chat lineage renames ChatML's ``<|im_end|>`` away and defines these
+# role/eos markers instead. Reusing the builder's own constants keeps the key aligned
+# with what DeepSeekContinuousTokenBuilder validates at construction. This table is the
+# high-confidence path; families absent from it still get a suggestion from
+# ``_constructible_text_families``.
+_DEEPSEEK_TOKENIZER_KEY_TOKENS = (
+    DeepSeekContinuousTokenBuilder._EOS_TOKEN,
+    DeepSeekContinuousTokenBuilder._ASSISTANT_TOKEN,
+)
+_CHATML_IM_END_TOKEN = "<|im_end|>"
+
+
+def _family_from_tokenizer_special_tokens(tokenizer: Any) -> ContinuousTokenModelFamily | None:
+    """Exact special-token key for tokenizers that identify a family themselves.
+
+    Only consulted when the builder inferred from ``model_type`` cannot be constructed,
+    and only to write the error. Matching is exact on token presence; nothing is guessed
+    from repository or tokenizer names.
+    """
+    if all(
+        _tokenizer_defines_token(tokenizer, token) for token in _DEEPSEEK_TOKENIZER_KEY_TOKENS
+    ) and not _tokenizer_defines_token(tokenizer, _CHATML_IM_END_TOKEN):
+        return ContinuousTokenModelFamily.DEEPSEEK
+    return None
+
+
+def _tokenizer_defines_token(tokenizer: Any, token: str) -> bool:
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if token_id is None:
+        return False
+    return token_id != getattr(tokenizer, "unk_token_id", None)
 
 
 def _is_multimodal_processor(processor: Any | None) -> bool:
