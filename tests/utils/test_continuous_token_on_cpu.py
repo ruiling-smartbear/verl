@@ -515,10 +515,18 @@ def test_auto_family_construction_error_does_not_assume_deepseek():
     assert "GLMContinuousTokenBuilder" in message
     assert "required token '<|observation|>'" in message
     assert "data.continuous_token.model_family" in message
-    assert "deepseek" not in message
-    # Suggestions are the families that actually construct with this tokenizer, with
-    # the catch-all last rather than presented as a match.
-    assert message.rstrip(".").endswith("default")
+    # No family is recommended without positive evidence. Constructing is not evidence:
+    # the builders that validate nothing accept any tokenizer, so a "these construct"
+    # list would name families nothing supports. The message gives the criterion and
+    # the menu instead -- deepseek appears only as one entry of that menu.
+    assert "model_family=deepseek" not in message
+    assert "match family" not in message
+    assert "do not identify a family" in message
+    assert "chat template" in message
+    # A text run must not be offered VL families; they raise without a processor.
+    assert "qwen3" in message
+    assert "qwenvl" not in message
+    assert "kimivl" not in message
 
 
 def test_explicit_model_family_override_selects_the_matching_builder():

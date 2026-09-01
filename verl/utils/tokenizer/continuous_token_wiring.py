@@ -325,16 +325,19 @@ def create_continuous_token_builder(
             f"{_normalize_hf_model_type(hf_model_type)!r}, cannot be constructed: {exc}. This "
             f"checkpoint pairs a registered architecture with a tokenizer and chat template "
             f"that builder does not support. "
-            + _model_family_override_hint(tokenizer, chat_template_kwargs, builder_cls)
+            + _model_family_override_hint(tokenizer, has_multimodal_processor=has_mm_processor)
         ) from exc
 
 
-def _model_family_override_hint(
-    tokenizer: Any,
-    chat_template_kwargs: dict[str, Any] | None,
-    failed_builder_cls: type[Any],
-) -> str:
-    """Name the family to set, derived from the tokenizer instead of assumed."""
+def _model_family_override_hint(tokenizer: Any, *, has_multimodal_processor: bool) -> str:
+    """Name a family only with positive evidence from this tokenizer.
+
+    Construction succeeding is not evidence: the builders that validate nothing
+    (``default``, and any family whose builder never calls ``require_token_id``)
+    accept every tokenizer, so a "these can be constructed" list would name families
+    nothing supports. When the special tokens do not identify a family, give the knob
+    and the criterion and let the user apply what they know about their checkpoint.
+    """
     suggested = _family_from_tokenizer_special_tokens(tokenizer)
     if suggested is not None:
         return (
@@ -342,55 +345,33 @@ def _model_family_override_hint(
             f"data.continuous_token.model_family={suggested.value} to select "
             f"{get_continuous_token_builder_class(suggested).__name__} explicitly."
         )
-    candidates = _constructible_text_families(tokenizer, chat_template_kwargs, exclude=failed_builder_cls)
-    if candidates:
-        return (
-            f"Set data.continuous_token.model_family to the family whose builder matches this "
-            f"checkpoint's chat template; these construct with this tokenizer: "
-            f"{', '.join(candidates)}."
-        )
     return (
-        f"Set data.continuous_token.model_family to the family whose builder matches this "
-        f"checkpoint's chat template. Supported families: {', '.join(CONTINUOUS_TOKEN_BUILDER_FAMILIES)}."
+        f"This tokenizer's special tokens do not identify a family. Set "
+        f"data.continuous_token.model_family to the family whose builder implements this "
+        f"checkpoint's chat template -- the conversation protocol, not the architecture -- "
+        f"or to 'default' for plain concatenation. Families available on this path: "
+        f"{', '.join(_families_for_path(has_multimodal_processor=has_multimodal_processor))}."
     )
 
 
-def _constructible_text_families(
-    tokenizer: Any,
-    chat_template_kwargs: dict[str, Any] | None,
-    *,
-    exclude: type[Any],
-) -> list[str]:
-    """Text families whose builder accepts this tokenizer, one name per builder class.
+def _families_for_path(*, has_multimodal_processor: bool) -> list[str]:
+    """Families whose builder matches this run, so the menu holds no dead options.
 
-    Only consulted to write the error above. Construction is a special-token lookup with
-    no side effects, so trying every family is cheap and, unlike a fixed suggestion, can
-    never name a family that fails the same way. ``default`` is listed last because it
-    accepts any tokenizer and is therefore the generic answer, not evidence of a match.
+    A VL builder raises without a processor and a text builder raises with one, so
+    listing both halves would offer families that cannot be selected here.
     """
-    candidates: list[str] = []
-    seen_classes: set[type[Any]] = {exclude}
-    for family, builder_cls in _CONTINUOUS_TOKEN_BUILDER_REGISTRY.items():
-        if builder_cls in seen_classes or builder_cls.supports_multimodal():
-            continue
-        try:
-            builder_cls(tokenizer, chat_template_kwargs=chat_template_kwargs)
-        except Exception:
-            continue
-        seen_classes.add(builder_cls)
-        candidates.append(family.value)
-    default_family = ContinuousTokenModelFamily.DEFAULT.value
-    if default_family in candidates:
-        candidates.remove(default_family)
-        candidates.append(default_family)
-    return candidates
+    return [
+        family.value
+        for family, builder_cls in _CONTINUOUS_TOKEN_BUILDER_REGISTRY.items()
+        if builder_cls.supports_multimodal() == has_multimodal_processor
+    ]
 
 
 # The DeepSeek chat lineage renames ChatML's ``<|im_end|>`` away and defines these
 # role/eos markers instead. Reusing the builder's own constants keeps the key aligned
-# with what DeepSeekContinuousTokenBuilder validates at construction. This table is the
-# high-confidence path; families absent from it still get a suggestion from
-# ``_constructible_text_families``.
+# with what DeepSeekContinuousTokenBuilder validates at construction. A tokenizer that
+# matches no entry gets no family named for it: this table is the only positive evidence
+# available here, and guessing without it is what the suggestion is meant to avoid.
 _DEEPSEEK_TOKENIZER_KEY_TOKENS = (
     DeepSeekContinuousTokenBuilder._EOS_TOKEN,
     DeepSeekContinuousTokenBuilder._ASSISTANT_TOKEN,
